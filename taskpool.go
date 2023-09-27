@@ -1,9 +1,12 @@
 package taskpool
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
+
+	"log/slog"
 
 	"go.uber.org/atomic"
 )
@@ -17,6 +20,7 @@ type TaskPool interface {
 type taskPool struct {
 	conf *taskPoolConfig
 	ec   *errCollector
+	*poolStat
 
 	wg         *sync.WaitGroup
 	workerChan chan struct{}
@@ -29,6 +33,7 @@ type taskPoolConfig struct {
 	jitter         float64 // The 'jitter' is a factor used to randomly generate retry time intervals.
 	retryTime      int     // The 'retryTime' represents how much time will the error be retried.
 	capacity       int
+	workerNum      int
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 }
@@ -36,6 +41,13 @@ type taskPoolConfig struct {
 type errCollector struct {
 	errorChan chan error
 	*sync.Mutex
+}
+
+type poolStat struct {
+	totalTask    *atomic.Int32
+	consumedTask *atomic.Int32
+	succTask     *atomic.Int32
+	failedTask   *atomic.Int32
 }
 
 const (
@@ -61,6 +73,7 @@ func New(capacity int, opts ...Option) TaskPool {
 			jitter:         defaultJitter,
 			retryTime:      0,
 			capacity:       capacity,
+			workerNum:      defaultWorkerNum,
 			initialBackoff: defaultInitialBackoff,
 		},
 
@@ -69,14 +82,22 @@ func New(capacity int, opts ...Option) TaskPool {
 			Mutex:     new(sync.Mutex),
 		},
 
-		workerChan: make(chan struct{}, defaultWorkerNum),
-		taskChan:   make(chan func() error, capacity),
-		wg:         new(sync.WaitGroup),
+		poolStat: &poolStat{
+			totalTask:    atomic.NewInt32(0),
+			consumedTask: atomic.NewInt32(0),
+			succTask:     atomic.NewInt32(0),
+			failedTask:   atomic.NewInt32(0),
+		},
+
+		wg: new(sync.WaitGroup),
 	}
 
 	for _, o := range opts {
-		o(tp)
+		o(tp.conf)
 	}
+
+	tp.workerChan = make(chan struct{}, tp.conf.workerNum)
+	tp.taskChan = make(chan func() error, tp.conf.capacity)
 
 	go tp.consumeTasks()
 	return tp
@@ -84,6 +105,7 @@ func New(capacity int, opts ...Option) TaskPool {
 
 func (t *taskPool) Run(task func() error) {
 	t.wg.Add(1)
+	t.totalTask.Inc()
 	t.taskChan <- task
 }
 
@@ -94,12 +116,15 @@ func (t *taskPool) consumeTasks() {
 			return
 		}
 
+		t.consumedTask.Inc()
 		t.workerChan <- struct{}{}
 		go t.runWithRetry(task)
 	}
 }
 
 func (t *taskPool) Close() {
+	slog.Info(fmt.Sprintf("totalTask:%d, consumedTask:%d, succTask:%d, failedTask:%d", t.totalTask.Load(),
+		t.consumedTask.Load(), t.succTask.Load(), t.failedTask.Load()))
 	if t.closed.CompareAndSwap(false, true) {
 		close(t.taskChan)
 	}
@@ -138,7 +163,10 @@ func (t *taskPool) runWithRetry(task func() error) {
 	}
 
 	if err != nil {
+		t.failedTask.Inc()
 		t.ec.errorChan <- err
+	} else {
+		t.succTask.Inc()
 	}
 	<-t.workerChan
 }
